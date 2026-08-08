@@ -12,22 +12,25 @@ requires weighing evidence and applying judgment.
 
 Why this is more than "AI decides X"
 --------------------------------------
-1. Two-sided, structured evidence. A case has an explicit claimant and
-   respondent, each submitting their own evidence (up to
-   MAX_EVIDENCE_PER_PARTY URLs), plus an explicit `resolution_criteria`
-   the arbitrator must apply -- the model is never asked to invent its
-   own standard of fairness.
+1. Two-sided, structured evidence, with a real chance to respond. A case
+   has an explicit claimant and respondent, each submitting their own
+   evidence (up to MAX_EVIDENCE_PER_PARTY URLs) against an explicit
+   `resolution_criteria`. Critically, `resolve_case` is gated on the
+   respondent explicitly calling `mark_response_ready` first -- a case
+   can't be resolved the instant it's opened, off the claimant's
+   evidence alone, before the respondent has had a chance to answer.
 2. Comparative consensus. `gl.eq_principle.prompt_comparative` re-runs
    the full evidence-weighing step on every validator independently;
    the network only finalizes a verdict the validators substantively
-   agree on (same verdict, same confidence tier, reasoning that applies
-   the same criteria to the same evidence).
-3. A bounded appeal lifecycle instead of a single unappealable verdict.
-   Either party can appeal a verdict exactly once (`APPEAL_LIMIT`); the
-   appeal re-runs consensus from scratch with an explicit instruction
-   not to defer to the earlier verdict, and the second verdict is FINAL.
-   This gives subjective arbitration a due-process safety valve without
-   letting either side stall the case forever.
+   agree on (same verdict, same confidence tier -- see "Design lesson"
+   in the README for why reasoning text is deliberately excluded from
+   the match criteria).
+3. A bounded appeal lifecycle with a real appeal evidence exchange.
+   Either party can appeal a verdict exactly once (`APPEAL_LIMIT`).
+   Appealing reopens evidence submission for both sides
+   (`add_claimant_evidence` / `add_respondent_evidence`) and resets the
+   response-ready gate, so the appeal round isn't silently decided on
+   evidence frozen from the first round. The appeal verdict is FINAL.
 4. Deterministic post-processing outside the non-deterministic block.
    `_normalize_verdict` and `_validate_evidence` are plain, side-effect
    free Python that run before/after consensus and are independently
@@ -77,6 +80,7 @@ class Case:
     reasoning: str
     confidence: str
     appeal_count: u32
+    respondent_ready: bool
 
 
 def _validate_evidence(evidence: list[str]) -> list[str]:
@@ -197,20 +201,23 @@ class SubjectiveArbitrator(gl.Contract):
             reasoning="",
             confidence="",
             appeal_count=u32(0),
+            respondent_ready=False,
         )
         return case_id
 
     @gl.public.write
     def add_respondent_evidence(self, case_id: str, evidence: list[str]) -> None:
-        """The respondent submits their side's evidence while the case
-        is still OPEN."""
+        """The respondent submits their side's evidence. Allowed while
+        the case is OPEN (initial round) or APPEALED (appeal round),
+        so the respondent isn't locked out of the appeal evidence
+        exchange."""
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
         if gl.message.sender_address != case.respondent:
             raise Exception("only the respondent can add respondent evidence")
-        if case.status != STATUS_OPEN:
-            raise Exception("evidence can only be added while the case is OPEN")
+        if case.status != STATUS_OPEN and case.status != STATUS_APPEALED:
+            raise Exception("evidence can only be added while the case is OPEN or APPEALED")
 
         existing = [e for e in case.respondent_evidence]
         validated_new = _validate_evidence(evidence)
@@ -222,15 +229,69 @@ class SubjectiveArbitrator(gl.Contract):
         self.cases[case_id] = case
 
     @gl.public.write
+    def add_claimant_evidence(self, case_id: str, evidence: list[str]) -> None:
+        """The claimant may add further evidence -- most usefully during
+        an APPEALED round, to rebut new respondent evidence. Allowed
+        while the case is OPEN or APPEALED, same as the respondent's
+        method, for symmetry."""
+        case = self.cases.get(case_id)
+        if case is None:
+            raise Exception("unknown case_id")
+        if gl.message.sender_address != case.claimant:
+            raise Exception("only the claimant can add claimant evidence")
+        if case.status != STATUS_OPEN and case.status != STATUS_APPEALED:
+            raise Exception("evidence can only be added while the case is OPEN or APPEALED")
+
+        existing = [e for e in case.claimant_evidence]
+        validated_new = _validate_evidence(evidence)
+        merged = existing + validated_new
+        if len(merged) > MAX_EVIDENCE_PER_PARTY:
+            raise Exception(f"at most {MAX_EVIDENCE_PER_PARTY} evidence items per party")
+
+        case.claimant_evidence = merged
+        self.cases[case_id] = case
+
+    @gl.public.write
+    def mark_response_ready(self, case_id: str) -> None:
+        """The respondent explicitly signals that they are done
+        submitting evidence for the current round (initial or appeal)
+        and the case may now be resolved. Required before `resolve_case`
+        can run -- see that method's gate below -- so a case can no
+        longer be resolved off of the claimant's evidence alone before
+        the respondent has had a real chance to respond."""
+        case = self.cases.get(case_id)
+        if case is None:
+            raise Exception("unknown case_id")
+        if gl.message.sender_address != case.respondent:
+            raise Exception("only the respondent can mark the case response-ready")
+        if case.status != STATUS_OPEN and case.status != STATUS_APPEALED:
+            raise Exception("case is not in a round awaiting a response")
+
+        case.respondent_ready = True
+        self.cases[case_id] = case
+
+    @gl.public.write
     def resolve_case(self, case_id: str) -> None:
         """Run one consensus round: every validator independently reads
         both parties' evidence, applies the resolution criteria, and the
-        network only accepts a verdict they substantively agree on."""
+        network only accepts a verdict they substantively agree on.
+
+        Requires `respondent_ready` to be set for the current round (via
+        `mark_response_ready`) so a case can't be resolved the instant
+        it's opened, before the respondent has had a chance to submit
+        evidence -- otherwise both the initial verdict and, since
+        evidence was frozen after OPEN, the appeal verdict too, would be
+        decided on the claimant's evidence alone."""
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
         if case.status != STATUS_OPEN and case.status != STATUS_APPEALED:
             raise Exception("case is not awaiting resolution")
+        if not case.respondent_ready:
+            raise Exception(
+                "respondent has not marked this round response-ready -- "
+                "call mark_response_ready(case_id) first"
+            )
 
         dispute_summary = case.dispute_summary
         resolution_criteria = case.resolution_criteria
@@ -307,6 +368,7 @@ with }}:
         case.confidence = parsed["confidence"]
         case.reasoning = parsed["reasoning"]
         case.status = STATUS_FINAL if is_appeal_round else STATUS_VERDICT_REACHED
+        case.respondent_ready = False
         self.cases[case_id] = case
 
     @gl.public.write
