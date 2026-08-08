@@ -17,8 +17,10 @@ decide what to do with funds or reputation.
 | Concern | How it's handled |
 |---|---|
 | Non-determinism | Evidence fetches + the LLM call live inside one closure (`independent_arbitration`), the only place `gl.get_webpage` / `gl.nondet.exec_prompt` are allowed to run. |
-| Consensus mechanism | `gl.eq_principle.prompt_comparative` — every validator independently re-weighs both parties' evidence against the stated criteria; the network only finalizes a verdict validators substantively agree on. |
+| Consensus mechanism | `gl.eq_principle.prompt_comparative` — every validator independently re-weighs both parties' evidence against the stated criteria; the network only finalizes a verdict validators substantively agree on (`verdict` + `confidence` must match; `reasoning` wording may vary — see "Design lesson"). |
 | Structured, two-sided input | A case has an explicit claimant and respondent, each with their own bounded evidence list, plus an explicit `resolution_criteria` string — the model applies a standard the parties agreed to, not one it invents. |
+| A real chance to respond | `resolve_case` is gated on the respondent calling `mark_response_ready` first, for **both** the initial round and the appeal round. A case can't be decided off the claimant's evidence alone before the respondent has had a chance to answer. |
+| Real appeal evidence exchange | `appeal_case` reopens evidence submission for both sides (`add_claimant_evidence` / `add_respondent_evidence`) and resets the ready gate, so the appeal round isn't silently decided on evidence frozen from the first round. |
 | Deterministic validation | `_validate_evidence` and `_normalize_verdict` are plain, I/O-free Python, independently unit-testable. |
 | Due process | A verdict can be appealed exactly once (`APPEAL_LIMIT`); the appeal reruns consensus from scratch with an explicit instruction not to defer to the earlier verdict, then the case is `FINAL`. |
 
@@ -37,6 +39,7 @@ Case
   reasoning:            str
   confidence:           str
   appeal_count:         u32
+  respondent_ready:     bool  # gates resolve_case for the current round
 
 SubjectiveArbitrator
   cases:       TreeMap[str, Case]  # keyed by "case-<n>"
@@ -46,24 +49,34 @@ SubjectiveArbitrator
 ## Case lifecycle
 
 ```
-open_case (by claimant)
-      │
-      ▼
-    OPEN ──resolve_case──► VERDICT_REACHED ──appeal_case──► APPEALED
-                                                                 │
-                                                          resolve_case
-                                                                 ▼
-                                                               FINAL
+open_case (by claimant)                     add_claimant_evidence
+      │                                      add_respondent_evidence
+      ▼                                      mark_response_ready (respondent)
+    OPEN ───────────────────resolve_case────► VERDICT_REACHED
+      ▲  (blocked until respondent_ready)            │
+      │                                          appeal_case
+      │                                                ▼
+      └──────────────── evidence reopens ──────── APPEALED
+                                                        │
+                                        resolve_case (blocked until
+                                        respondent_ready again)
+                                                        ▼
+                                                     FINAL
 ```
 
-Only one appeal round exists by design — see "Limitations".
+`resolve_case` always requires `respondent_ready == True` for the round
+it's resolving; `mark_response_ready` resets to `False` after every
+resolution, so the appeal round needs its own fresh ready signal. Only
+one appeal round exists by design — see "Limitations".
 
 ## Public interface
 
 - `open_case(respondent: Address, dispute_summary: str, resolution_criteria: str, claimant_evidence: list[str]) -> str` — caller becomes claimant; returns `case_id`.
-- `add_respondent_evidence(case_id: str, evidence: list[str]) -> None` — respondent-only, only while `OPEN`.
-- `resolve_case(case_id: str) -> None` — runs one consensus round.
-- `appeal_case(case_id: str) -> None` — claimant or respondent only, once per case.
+- `add_respondent_evidence(case_id: str, evidence: list[str]) -> None` — respondent-only; allowed while `OPEN` or `APPEALED`.
+- `add_claimant_evidence(case_id: str, evidence: list[str]) -> None` — claimant-only; allowed while `OPEN` or `APPEALED` (mainly for appeal rebuttals).
+- `mark_response_ready(case_id: str) -> None` — respondent-only; must be called before `resolve_case` will run for the current round.
+- `resolve_case(case_id: str) -> None` — runs one consensus round; reverts if `respondent_ready` is not set.
+- `appeal_case(case_id: str) -> None` — claimant or respondent only, once per case; reopens evidence and resets the ready gate.
 - `get_case(case_id: str) -> Case` — view.
 - `get_case_count() -> u256` — view.
 
@@ -73,19 +86,24 @@ Only one appeal round exists by design — see "Limitations".
   `_validate_evidence` / `_normalize_verdict`. No Studio, no network:
   `pytest test/test_normalize_verdict.py`
 - `test/test_subjective_arbitrator_integration.py` — full lifecycle
-  (open → evidence → resolve → appeal → resolve → FINAL) plus access
+  (open → blocked resolve → evidence → ready → resolve → appeal →
+  blocked resolve → evidence → ready → resolve → FINAL) plus access
   control checks, against a running GenLayer Studio / local validator
   set: `gltest test/test_subjective_arbitrator_integration.py`
 
 ## Known limitations (by design)
 
-- No staking, bonding, or slashing — access control is enforced (only
-  the respondent adds respondent evidence, only a party can appeal), but
+- No staking, bonding, or slashing — access control is enforced, but
   economic griefing resistance (e.g. requiring a bond to open a case or
   to appeal) is left to the composing contract.
-- No timeouts — a respondent who never submits evidence doesn't block
-  `resolve_case`; the arbitrator will just note "(no respondent evidence
-  submitted)" and weigh accordingly.
+- No automatic timeout: if a respondent never calls `mark_response_ready`,
+  the case stays stuck in `OPEN` (or `APPEALED`) indefinitely — there is
+  an enforceable response-ready *condition*, but not yet a time-based
+  fallback that lets the claimant force resolution after a window
+  elapses. A composing contract that needs liveness guarantees against
+  an unresponsive respondent should add its own timeout/escalation path
+  (e.g. tracking block height and calling a future `force_resolve_after`
+  variant) on top of this primitive.
 - Exactly one appeal is allowed; there is no second-level appellate body.
   If your use case needs a longer appeal chain or a human tiebreaker
   after `FINAL`, add that in the composing contract.
@@ -115,17 +133,36 @@ field should actually block consensus — free-text justification fields
 are usually better treated as informational, not part of what must
 match.
 
+## Design lesson: gate resolution on a response-ready signal
+
+The first submitted version let anyone call `resolve_case` immediately
+after `open_case`, and only allowed respondent evidence while the case
+was `OPEN` — so an eager caller could resolve a case (and, later, its
+appeal too, since evidence was frozen after the first round) using only
+the claimant's side of the story. The fix adds `respondent_ready`, set
+via `mark_response_ready` and required by `resolve_case`, and reopens
+both parties' evidence submission during `APPEALED`. General takeaway:
+in a primitive with two interested parties, "who can trigger the
+non-deterministic step" and "whose evidence is actually in scope when it
+runs" need to be checked together — gating the trigger without also
+reopening the input channel (or vice versa) leaves the same class of bug
+in a different spot.
+
 ## Deployed instance (GenLayer Studio)
 
-- Contract address: `0xc992059580FA35baaBE47D6aB5a6ed1845af61A6`
-- Explorer: https://explorer-studio.genlayer.com/address/0xc992059580FA35baaBE47D6aB5a6ed1845af61A6
+- Contract address: `0x70e193401E833F4413d3D56Ec0e3247C2aF62014`
+- Explorer: https://explorer-studio.genlayer.com/address/0x70e193401E833F4413d3D56Ec0e3247C2aF62014
 
-Manually exercised end-to-end on this deployment: `open_case` →
-`resolve_case` (VERDICT_REACHED via `prompt_comparative` consensus) →
-`appeal_case` (VERDICT_REACHED → APPEALED) → `resolve_case` again
-(APPEALED → FINAL), plus access-control checks (only the respondent can
-add respondent evidence, only a party to the case can appeal, appeals
-are capped at `APPEAL_LIMIT`).
+Manually exercised end-to-end on this deployment, including the two
+fixes from review: `open_case` → `resolve_case` blocked with
+`respondent has not marked this round response-ready` (confirms a case
+can no longer be resolved off the claimant's evidence alone) →
+`add_respondent_evidence` → `mark_response_ready` → `resolve_case`
+(VERDICT_REACHED) → `appeal_case` (APPEALED, `respondent_ready` reset)
+→ `resolve_case` blocked again pre-ready → `add_claimant_evidence` +
+`add_respondent_evidence` (both sides added fresh evidence during the
+appeal round) → `mark_response_ready` → `resolve_case` (FINAL, with
+both parties' appeal-round evidence reflected in state).
 
 ## Dependency pin
 
