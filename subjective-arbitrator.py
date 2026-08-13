@@ -14,11 +14,11 @@ Why this is more than "AI decides X"
 --------------------------------------
 1. Two-sided, structured evidence, with a real chance to respond. A case
    has an explicit claimant and respondent, each submitting their own
-   evidence (up to MAX_EVIDENCE_PER_PARTY URLs) against an explicit
-   `resolution_criteria`. Critically, `resolve_case` is gated on the
-   respondent explicitly calling `mark_response_ready` first -- a case
-   can't be resolved the instant it's opened, off the claimant's
-   evidence alone, before the respondent has had a chance to answer.
+   evidence against an explicit `resolution_criteria`. Critically,
+   `resolve_case` is gated on the respondent explicitly calling
+   `mark_response_ready` first -- a case can't be resolved the instant
+   it's opened, off the claimant's evidence alone, before the respondent
+   has had a chance to answer.
 2. Comparative consensus. `gl.eq_principle.prompt_comparative` re-runs
    the full evidence-weighing step on every validator independently;
    the network only finalizes a verdict the validators substantively
@@ -31,7 +31,19 @@ Why this is more than "AI decides X"
    (`add_claimant_evidence` / `add_respondent_evidence`) and resets the
    response-ready gate, so the appeal round isn't silently decided on
    evidence frozen from the first round. The appeal verdict is FINAL.
-4. Deterministic post-processing outside the non-deterministic block.
+4. Deterministic liveness. The respondent can no longer block a case
+   forever by refusing to `mark_response_ready`: each round (initial and
+   appeal) carries a `round_start_timestamp`, and either party can call
+   `force_resolve(case_id)` after the configured `response_timeout_seconds`
+   window has elapsed (the transaction timestamp is deterministic on
+   GenLayer, so the deadline comparison is consensus-safe).
+5. Per-round appeal evidence capacity. Evidence is capped per round, not
+   cumulatively: the initial round allows up to `MAX_EVIDENCE_PER_PARTY`
+   items per party, and the appeal round allows a fresh
+   `MAX_EVIDENCE_PER_PARTY` items per party on top, so either party can
+   always add new appeal evidence regardless of how many items were
+   submitted in the first round.
+6. Deterministic post-processing outside the non-deterministic block.
    `_normalize_verdict` and `_validate_evidence` are plain, side-effect
    free Python that run before/after consensus and are independently
    unit-testable.
@@ -40,21 +52,29 @@ Reuse pattern
 -------------
 A DAO, marketplace, or escrow contract holds this contract's address,
 calls `open_case` when a dispute arises, lets both sides submit
-evidence, calls `resolve_case`, and reads `get_case(case_id)` once
-`status` is `VERDICT_REACHED` or `FINAL` to decide what to do with funds
-or reputation. Token custody, staking, and slashing are deliberately
-left to the composing contract -- see README "Limitations".
+evidence, calls `resolve_case` (or `force_resolve` after the timeout),
+and reads `get_case(case_id)` once `status` is `VERDICT_REACHED` or
+`FINAL` to decide what to do with funds or reputation. Token custody,
+staking, and slashing are deliberately left to the composing contract --
+see README "Limitations".
 """
 
 from genlayer import *
 from dataclasses import dataclass
 import json
+from datetime import datetime, timezone
 
 # --- Tunable constants -----------------------------------------------------
 
 MAX_EVIDENCE_PER_PARTY = 3
 MAX_EXCERPT_CHARS = 1500
 APPEAL_LIMIT = 1  # each case may be appealed at most once
+
+# Default response window. Either party may call force_resolve(case_id)
+# once the current round's deadline (round_start_timestamp + timeout)
+# has passed, even if the respondent never called mark_response_ready.
+# Overridable via the constructor argument `response_timeout_seconds`.
+RESPONSE_TIMEOUT_SECONDS = 604800  # 7 days
 
 # --- Case status enum --------------------------------------------------
 
@@ -81,13 +101,23 @@ class Case:
     confidence: str
     appeal_count: u32
     respondent_ready: bool
+    round_start_timestamp: u256
+
+
+def _current_timestamp() -> u256:
+    """Deterministic per-transaction Unix timestamp (seconds). GenLayer
+    pins the stdlib clock to the transaction datetime, so every
+    validator computing the deadline comparison sees the same value."""
+    return u256(int(datetime.now(timezone.utc).timestamp()))
 
 
 def _validate_evidence(evidence: list[str]) -> list[str]:
     """Deterministic validation shared by case creation and evidence
-    submission. No I/O -- just format checking."""
+    submission. No I/O -- just format checking. The per-call limit is
+    MAX_EVIDENCE_PER_PARTY; the per-round cumulative cap is enforced in
+    the write methods via _round_evidence_cap."""
     if len(evidence) > MAX_EVIDENCE_PER_PARTY:
-        raise Exception(f"at most {MAX_EVIDENCE_PER_PARTY} evidence items per party")
+        raise Exception(f"at most {MAX_EVIDENCE_PER_PARTY} evidence items per call")
     validated = []
     for item in evidence:
         item = item.strip()
@@ -95,6 +125,15 @@ def _validate_evidence(evidence: list[str]) -> list[str]:
             raise Exception(f"invalid evidence URL: {item!r}")
         validated.append(item)
     return validated
+
+
+def _round_evidence_cap(case: "Case") -> int:
+    """Per-round evidence capacity. Round 0 (initial) allows
+    MAX_EVIDENCE_PER_PARTY items per party; each appeal round grants a
+    fresh MAX_EVIDENCE_PER_PARTY budget on top, so the cap grows with
+    the number of rounds instead of locking parties out of the appeal
+    evidence exchange."""
+    return MAX_EVIDENCE_PER_PARTY * (int(case.appeal_count) + 1)
 
 
 def _strip_code_fence(raw: str) -> str:
@@ -112,14 +151,21 @@ def _strip_code_fence(raw: str) -> str:
     return s
 
 
-def _normalize_verdict(raw: str) -> dict:
-    """Deterministically parse and sanity-check the JSON string that
-    validators already reached consensus on. Runs after consensus, does
-    no I/O, and is safe to unit test directly."""
-    try:
-        data = json.loads(_strip_code_fence(raw))
-    except (ValueError, TypeError):
-        raise Exception("arbitrator: agreed response was not valid JSON")
+def _normalize_verdict(raw) -> dict:
+    """Deterministically parse and sanity-check the agreed consensus
+    result. `gl.eq_principle.prompt_comparative` hands back the agreed
+    response as a parsed dict; a JSON string is also tolerated to stay
+    robust across SDK versions. Runs after consensus, does no I/O, and
+    is safe to unit test directly."""
+    if isinstance(raw, dict):
+        data = raw
+    elif isinstance(raw, str):
+        try:
+            data = json.loads(_strip_code_fence(raw))
+        except (ValueError, TypeError):
+            raise Exception("arbitrator: agreed response was not valid JSON")
+    else:
+        raise Exception("arbitrator: agreed response must be a JSON object or string")
     if not isinstance(data, dict):
         raise Exception("arbitrator: agreed response must be a JSON object")
 
@@ -155,10 +201,12 @@ def _coerce_address(value) -> Address:
 class SubjectiveArbitrator(gl.Contract):
     cases: TreeMap[str, Case]
     case_count: u256
+    response_timeout_seconds: u256
 
-    def __init__(self):
+    def __init__(self, response_timeout_seconds: int = RESPONSE_TIMEOUT_SECONDS):
         self.cases = TreeMap()
         self.case_count = u256(0)
+        self.response_timeout_seconds = u256(response_timeout_seconds)
 
     # -- Write methods -------------------------------------------------
 
@@ -202,6 +250,7 @@ class SubjectiveArbitrator(gl.Contract):
             confidence="",
             appeal_count=u32(0),
             respondent_ready=False,
+            round_start_timestamp=_current_timestamp(),
         )
         return case_id
 
@@ -211,6 +260,7 @@ class SubjectiveArbitrator(gl.Contract):
         the case is OPEN (initial round) or APPEALED (appeal round),
         so the respondent isn't locked out of the appeal evidence
         exchange."""
+        case_id = str(case_id)
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
@@ -222,8 +272,12 @@ class SubjectiveArbitrator(gl.Contract):
         existing = [e for e in case.respondent_evidence]
         validated_new = _validate_evidence(evidence)
         merged = existing + validated_new
-        if len(merged) > MAX_EVIDENCE_PER_PARTY:
-            raise Exception(f"at most {MAX_EVIDENCE_PER_PARTY} evidence items per party")
+        cap = _round_evidence_cap(case)
+        if len(merged) > cap:
+            raise Exception(
+                f"evidence cap reached for this round: at most {cap} "
+                f"total items per party across {int(case.appeal_count) + 1} round(s)"
+            )
 
         case.respondent_evidence = merged
         self.cases[case_id] = case
@@ -234,6 +288,7 @@ class SubjectiveArbitrator(gl.Contract):
         an APPEALED round, to rebut new respondent evidence. Allowed
         while the case is OPEN or APPEALED, same as the respondent's
         method, for symmetry."""
+        case_id = str(case_id)
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
@@ -245,8 +300,12 @@ class SubjectiveArbitrator(gl.Contract):
         existing = [e for e in case.claimant_evidence]
         validated_new = _validate_evidence(evidence)
         merged = existing + validated_new
-        if len(merged) > MAX_EVIDENCE_PER_PARTY:
-            raise Exception(f"at most {MAX_EVIDENCE_PER_PARTY} evidence items per party")
+        cap = _round_evidence_cap(case)
+        if len(merged) > cap:
+            raise Exception(
+                f"evidence cap reached for this round: at most {cap} "
+                f"total items per party across {int(case.appeal_count) + 1} round(s)"
+            )
 
         case.claimant_evidence = merged
         self.cases[case_id] = case
@@ -258,7 +317,12 @@ class SubjectiveArbitrator(gl.Contract):
         and the case may now be resolved. Required before `resolve_case`
         can run -- see that method's gate below -- so a case can no
         longer be resolved off of the claimant's evidence alone before
-        the respondent has had a real chance to respond."""
+        the respondent has had a real chance to respond.
+
+        If the respondent never calls this, the claimant/respondent can
+        still force resolution after the response window elapses via
+        `force_resolve(case_id)`."""
+        case_id = str(case_id)
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
@@ -281,7 +345,12 @@ class SubjectiveArbitrator(gl.Contract):
         it's opened, before the respondent has had a chance to submit
         evidence -- otherwise both the initial verdict and, since
         evidence was frozen after OPEN, the appeal verdict too, would be
-        decided on the claimant's evidence alone."""
+        decided on the claimant's evidence alone.
+
+        Liveness fallback: if the respondent never marks the round ready,
+        either party can call `force_resolve(case_id)` after the response
+        window (see `get_response_deadline`) has elapsed."""
+        case_id = str(case_id)
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
@@ -290,9 +359,76 @@ class SubjectiveArbitrator(gl.Contract):
         if not case.respondent_ready:
             raise Exception(
                 "respondent has not marked this round response-ready -- "
-                "call mark_response_ready(case_id) first"
+                "call mark_response_ready(case_id) first, or wait for the "
+                "response window to elapse and call force_resolve(case_id)"
             )
 
+        self._run_consensus_round(case_id)
+
+    @gl.public.write
+    def force_resolve(self, case_id: str) -> None:
+        """Force-resolution path for liveness. If the respondent never
+        calls `mark_response_ready`, either party to the case may call
+        this once the current round's response deadline has passed
+        (`round_start_timestamp + response_timeout_seconds`, a
+        deterministic per-transaction timestamp -- see
+        `get_response_deadline`). This runs the exact same consensus
+        round as `resolve_case`, so the verdict still requires validator
+        agreement on the evidence that is in scope."""
+        case_id = str(case_id)
+        case = self.cases.get(case_id)
+        if case is None:
+            raise Exception("unknown case_id")
+        if case.status != STATUS_OPEN and case.status != STATUS_APPEALED:
+            raise Exception("case is not awaiting resolution")
+
+        sender = gl.message.sender_address
+        if sender != case.claimant and sender != case.respondent:
+            raise Exception("only a party to the case can force-resolve")
+
+        now = _current_timestamp()
+        deadline = case.round_start_timestamp + self.response_timeout_seconds
+        if now < deadline:
+            raise Exception(
+                "response window has not elapsed yet -- cannot force-resolve "
+                f"(deadline is block timestamp {int(deadline)}, now is {int(now)})"
+            )
+
+        self._run_consensus_round(case_id)
+
+    @gl.public.write
+    def appeal_case(self, case_id: str) -> None:
+        """Either party may appeal a reached verdict exactly once. This
+        reopens the case for a fresh, from-scratch consensus round,
+        resets the response-ready gate, and starts a fresh response
+        window for the appeal round."""
+        case_id = str(case_id)
+        case = self.cases.get(case_id)
+        if case is None:
+            raise Exception("unknown case_id")
+
+        sender = gl.message.sender_address
+        if sender != case.claimant and sender != case.respondent:
+            raise Exception("only a party to the case can appeal")
+        if case.status != STATUS_VERDICT_REACHED:
+            raise Exception("only a case with a reached verdict can be appealed")
+        if case.appeal_count >= u32(APPEAL_LIMIT):
+            raise Exception("appeal limit already reached")
+
+        case.appeal_count = case.appeal_count + u32(1)
+        case.status = STATUS_APPEALED
+        case.respondent_ready = False
+        case.round_start_timestamp = _current_timestamp()
+        self.cases[case_id] = case
+
+    # -- Internal helpers ------------------------------------------------
+
+    def _run_consensus_round(self, case_id: str) -> None:
+        """Shared consensus execution used by both `resolve_case` and
+        `force_resolve`. Reads the case's current evidence, runs the
+        comparative-equivalence arbitration, and writes the agreed
+        verdict back to storage."""
+        case = self.cases[case_id]
         dispute_summary = case.dispute_summary
         resolution_criteria = case.resolution_criteria
         claimant_evidence = [e for e in case.claimant_evidence]
@@ -371,30 +507,11 @@ with }}:
         case.respondent_ready = False
         self.cases[case_id] = case
 
-    @gl.public.write
-    def appeal_case(self, case_id: str) -> None:
-        """Either party may appeal a reached verdict exactly once. This
-        reopens the case for a fresh, from-scratch consensus round."""
-        case = self.cases.get(case_id)
-        if case is None:
-            raise Exception("unknown case_id")
-
-        sender = gl.message.sender_address
-        if sender != case.claimant and sender != case.respondent:
-            raise Exception("only a party to the case can appeal")
-        if case.status != STATUS_VERDICT_REACHED:
-            raise Exception("only a case with a reached verdict can be appealed")
-        if case.appeal_count >= u32(APPEAL_LIMIT):
-            raise Exception("appeal limit already reached")
-
-        case.appeal_count = case.appeal_count + u32(1)
-        case.status = STATUS_APPEALED
-        self.cases[case_id] = case
-
     # -- Read methods ----------------------------------------------------
 
     @gl.public.view
     def get_case(self, case_id: str) -> Case:
+        case_id = str(case_id)
         case = self.cases.get(case_id)
         if case is None:
             raise Exception("unknown case_id")
@@ -403,3 +520,20 @@ with }}:
     @gl.public.view
     def get_case_count(self) -> u256:
         return self.case_count
+
+    @gl.public.view
+    def get_response_deadline(self, case_id: str) -> u256:
+        """Unix timestamp (transaction-time based) at which the current
+        round's response window ends. Once `now >= deadline`, a party may
+        call `force_resolve(case_id)` even if the respondent never marked
+        the round ready."""
+        case_id = str(case_id)
+        case = self.cases.get(case_id)
+        if case is None:
+            raise Exception("unknown case_id")
+        return case.round_start_timestamp + self.response_timeout_seconds
+
+    @gl.public.view
+    def get_response_timeout(self) -> u256:
+        """Configured response window length in seconds."""
+        return self.response_timeout_seconds
